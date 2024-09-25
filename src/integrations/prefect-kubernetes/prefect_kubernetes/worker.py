@@ -880,16 +880,18 @@ class KubernetesWorker(BaseWorker):
         """
         Stream job events.
 
-        Pick up from the current resource version returned by the API
-        in the case of a 410.
+        Restart from the current resource version returned by the API
+        in case of a 410.
 
-        See https://kubernetes.io/docs/reference/using-api/api-concepts/#efficient-detection-of-changes  # noqa
+        See https://kubernetes.io/docs/reference/using-api/api-concepts/#efficient-detection-of-changes
         """
         watch = kubernetes_asyncio.watch.Watch()
         resource_version = None
-        async with watch:
-            while True:
-                try:
+
+        while True:
+            try:
+                # Start the watch (using provided or updated resource version)
+                async with watch:
                     async for event in watch.stream(
                         func=batch_client.list_namespaced_job,
                         namespace=namespace,
@@ -897,17 +899,26 @@ class KubernetesWorker(BaseWorker):
                         **watch_kwargs,
                     ):
                         yield event
-                except ApiException as e:
-                    if e.status == 410:
-                        job_list = await batch_client.list_namespaced_job(
-                            namespace=namespace,
-                            field_selector=f"metadata.name={job_name}",
-                        )
 
-                        resource_version = job_list.metadata.resource_version
-                        watch_kwargs["resource_version"] = resource_version
-                    else:
-                        raise
+            except ApiException as e:
+                if e.status == 410:
+                    # 410 Gone means = resource version too old
+                    job_list = await batch_client.list_namespaced_job(
+                        namespace=namespace,
+                        field_selector=f"metadata.name={job_name}",
+                    )
+
+                    # get the latest resource version
+                    resource_version = job_list.metadata.resource_version
+                    watch_kwargs["resource_version"] = resource_version
+
+                    print(f"Resource version outdated (410). Restarting watch with resource_version: {resource_version}")
+                    
+                    # restart the watch loop
+                    watch = kubernetes_asyncio.watch.Watch()
+                else:
+                    raise
+
 
     async def _monitor_job_events(self, batch_client, job_name, logger, configuration):
         job = await batch_client.read_namespaced_job(
